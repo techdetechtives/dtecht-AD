@@ -1,0 +1,4 @@
+# Audit output (contains sensitive AD data - never commit)
+ADAudit-*/
+*.csv
+Summary.html
