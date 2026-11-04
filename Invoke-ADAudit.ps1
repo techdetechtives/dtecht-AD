@@ -43,8 +43,8 @@
     All scanners, all enabled computers seen in the last 90 days, current domain.
 
 .EXAMPLE
-    .\Invoke-ADAudit.ps1 -Scanners OSInventory,LapsBitLocker
-    AD-only scan; no traffic to member hosts.
+    .\Invoke-ADAudit.ps1 -Preset ADOnly -OpenReport
+    AD-only scan (LDAP + SYSVOL, no traffic to member hosts); opens the report when done.
 
 .EXAMPLE
     .\Invoke-ADAudit.ps1 -Scanners Smb,Spooler -DomainControllersOnly
@@ -94,18 +94,36 @@ param(
     # Previous run folder (or its results.json) to compare against
     [string]$Baseline,
 
-    [string]$OutputPath = (Join-Path -Path (Get-Location) -ChildPath ("ADAudit-" + (Get-Date -Format 'yyyyMMdd-HHmmss')))
+    [string]$OutputPath = (Join-Path -Path (Get-Location) -ChildPath ("ADAudit-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))),
+
+    # Full (default) | ADOnly: LDAP + SYSVOL only, no traffic to member hosts |
+    # DCsOnly: AD checks plus Events/Spooler/SMB on DCs only | HostsOnly: per-host scanners
+    [ValidateSet('Full', 'ADOnly', 'DCsOnly', 'HostsOnly')][string]$Preset,
+
+    # Open Summary.html when the run finishes
+    [switch]$OpenReport
 )
 
 $ErrorActionPreference = 'Stop'
+
+#region loader  (removed by build/Build-Package.ps1: the packaged script and module contain these files inline)
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-. (Join-Path $here 'lib\Common.ps1')
-# netapi32 helpers (NetLocalGroupGetMembers / NetShareEnum, read-only) are only compiled when needed
-if ($Scanners -contains 'LocalAdmin' -or $Scanners -contains 'Share') { . (Join-Path $here 'lib\Native.ps1') }
-. (Join-Path $here 'lib\Acl.ps1')
-. (Join-Path $here 'lib\Compare.ps1')
-. (Join-Path $here 'lib\Remediation.ps1')
+foreach ($lib in 'Common', 'Native', 'Acl', 'Compare', 'Remediation') { . (Join-Path $here "lib\$lib.ps1") }
 Get-ChildItem -Path (Join-Path $here 'Scanners') -Filter '*.ps1' | ForEach-Object { . $_.FullName }
+#endregion loader
+
+# Presets: a quick way to pick scanners. An explicit -Scanners wins.
+if ($Preset -and -not $PSBoundParameters.ContainsKey('Scanners')) {
+    $adOnly = @('DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'DomainControllers', 'AuditPolicy', 'Permissions')
+    switch ($Preset) {
+        'Full' { }
+        'ADOnly' { $Scanners = $adOnly }
+        'DCsOnly' { $Scanners = $adOnly + 'Events', 'Spooler', 'Smb'; $DomainControllersOnly = [switch]$true }
+        'HostsOnly' { $Scanners = @('Spooler', 'Smb', 'LocalAdmin', 'Share') }
+    }
+}
+# netapi32 helpers (NetLocalGroupGetMembers / NetShareEnum, read-only) are only compiled when needed
+if ($Scanners -contains 'LocalAdmin' -or $Scanners -contains 'Share') { Import-ADAuditNative }
 
 $adScanners = @($Scanners | Where-Object { $_ -in 'DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'DomainControllers', 'AuditPolicy', 'Permissions' })
 $hostScanners = @($Scanners | Where-Object { $_ -in 'Spooler', 'Smb', 'LocalAdmin', 'Share' })
@@ -315,7 +333,7 @@ $domainName = $null
 try { $domainName = ConvertTo-ADAuditDnsName (Get-ADAuditDefaultNamingContext -Server $Server -Credential $Credential) } catch { }
 $meta = [ordered]@{
     Tool        = 'dtecht-AD'
-    Version     = '1.1.0'
+    Version     = '1.2.0'
     Generated   = $started.ToString('yyyy-MM-ddTHH:mm:sszzz')
     DurationSec = [int]((Get-Date) - $started).TotalSeconds
     Domain      = $domainName
@@ -383,3 +401,4 @@ if ($baselineRun) {
         @($changes | Where-Object Change -eq 'Added').Count, @($changes | Where-Object Change -eq 'Removed').Count, @($changes | Where-Object Change -eq 'Changed').Count)
 }
 Write-Host "[+] Results written to $OutputPath"
+if ($OpenReport) { Invoke-Item -LiteralPath (Join-Path $OutputPath 'Summary.html') }

@@ -13,21 +13,55 @@ Read-only PowerShell AD audit scanners, modeled on PingCastle's health-check rul
 | SYSVOL | `Get-Content`, `Import-Csv`, `Get-Acl` on GPO files/folders | None |
 | Scanned hosts | TCP connect, SMB NEGOTIATE (no session), spooler pipe attributes, `NetLocalGroupGetMembers`, `NetShareEnum`, `LookupAccountSid`, one directory listing per share | None |
 
-`tests/Test-ReadOnly.ps1` enforces this. It parses every script and fails on any command outside a read-only allowlist (including external tools such as auditpol or net), any ADSI/registry/WMI/file write method, any assignment to directory entry properties, unexpected native APIs, or a DirectoryEntry created outside `lib/Common.ps1`. Run it before merging changes: `pwsh -File tests/Test-ReadOnly.ps1`.
+`tests/Test-ReadOnly.ps1` enforces this, including for the packaged files in `dist/` (each line is mapped back to its source file). It parses every script and fails on any command outside a read-only allowlist (including external tools such as auditpol or net), any ADSI/registry/WMI/file write method, any assignment to directory entry properties, unexpected native APIs, or a DirectoryEntry created outside `lib/Common.ps1`. Run it before merging changes: `pwsh -File tests/Test-ReadOnly.ps1`.
 
 Side effects that every authenticated read causes: logon/Kerberos events on DCs and hosts, a bad-password count if `-Credential` is mistyped, and SMB1 audit event 3000 when that audit is on (`-SkipSmb1` avoids it).
 
 ## Quick start
 
+Pick one. All three run the same tool; parameters are identical.
+
+**1. One file (easiest, works offline).** Copy `dist/dtecht-AD.ps1` to a domain-joined machine and run:
+
 ```powershell
-# From a domain-joined machine, as a domain user
-Set-ExecutionPolicy -Scope Process Bypass
-.\Invoke-ADAudit.ps1                                   # everything
-.\Invoke-ADAudit.ps1 -Scanners DomainPolicy,Accounts,Groups,OSInventory,LapsBitLocker   # AD-only, no host traffic
-.\Invoke-ADAudit.ps1 -Scanners Smb,Spooler -DomainControllersOnly
-.\Invoke-ADAudit.ps1 -Server dc01.corp.local -Credential (Get-Credential)            # LDAP as another account
-.\Invoke-ADAudit.ps1 -Scanners Events,AuditPolicy -EventDays 30                       # last 30 days of changes on DCs
-.\Invoke-ADAudit.ps1 -Baseline .\ADAudit-20261101-090000                              # what changed since that run
+powershell -ExecutionPolicy Bypass -File .\dtecht-AD.ps1 -Preset ADOnly -OpenReport
+```
+
+**2. Download and run (machine with internet access):**
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+irm https://raw.githubusercontent.com/techdetechtives/dtecht-AD/main/dist/dtecht-AD.ps1 -OutFile dtecht-AD.ps1
+(Get-FileHash .\dtecht-AD.ps1).Hash      # compare with dist/SHA256SUMS
+powershell -ExecutionPolicy Bypass -File .\dtecht-AD.ps1 -Preset ADOnly -OpenReport
+```
+
+**3. PowerShell module.** Copy the `dist/dtecht-AD` folder into a module path (e.g. `C:\Program Files\WindowsPowerShell\Modules`), then from any prompt:
+
+```powershell
+dtecht-ad -Preset ADOnly -OpenReport          # dtecht-ad is an alias of Invoke-DtechtAD
+Get-Help Invoke-DtechtAD -Full
+```
+
+From a clone of this repo, `.\Invoke-ADAudit.ps1` works the same way.
+
+### Presets
+
+| Preset | Runs | Traffic |
+|---|---|---|
+| `Full` (default) | Every scanner | LDAP/SYSVOL, DC event logs, TCP 445 to active computers |
+| `ADOnly` | DomainPolicy, Accounts, Groups, OSInventory, LapsBitLocker, DomainControllers, AuditPolicy, Permissions | LDAP + SYSVOL only, nothing sent to member hosts |
+| `DCsOnly` | AD checks + Events, Spooler, SMB on domain controllers only | DCs only |
+| `HostsOnly` | Spooler, Smb, LocalAdmin, Share | TCP 445 to active computers |
+
+`-Scanners` overrides the preset. More examples:
+
+```powershell
+.\dtecht-AD.ps1                                                    # everything
+.\dtecht-AD.ps1 -Preset DCsOnly -EventDays 30                      # DCs, plus 30 days of account/group changes
+.\dtecht-AD.ps1 -Baseline .\ADAudit-20261101-090000               # what changed since that run
+.\dtecht-AD.ps1 -Server dc01.corp.local -Credential (Get-Credential)   # LDAP as another account
+.\dtecht-AD.ps1 -Scanners Smb,Spooler -ComputerName srv01,srv02
 ```
 
 Output goes to `.\ADAudit-<timestamp>\`:
@@ -121,3 +155,13 @@ Run dtecht-AD only against Active Directory environments you own or are explicit
 ## License
 
 MIT - see [LICENSE](LICENSE). Some checks are inspired by [PingCastle](https://github.com/netwrix/pingcastle), [EthicalInsight](https://github.com/AlchemiistCreative/EthicalInsight) and [AD_Miner](https://github.com/AD-Security/AD_Miner); no code from those projects is included.
+
+## Development
+
+Edit the sources (`Invoke-ADAudit.ps1`, `lib/`, `Scanners/`), never `dist/`. Then:
+
+```powershell
+pwsh -File tests/Test-ReadOnly.ps1        # read-only guard
+pwsh -File build/Build-Package.ps1        # regenerate dist/dtecht-AD.ps1, the module and SHA256SUMS
+pwsh -File build/Build-Package.ps1 -Check # fails if dist/ is out of date
+```

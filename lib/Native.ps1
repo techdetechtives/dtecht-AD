@@ -7,7 +7,9 @@
     No API here creates, changes or deletes anything on the target.
 #>
 
-if (-not ('ADAudit.Native' -as [type])) {
+function Import-ADAuditNative {
+    # Compiles the helper once per session; only called when LocalAdmin or Share runs
+    if ('ADAudit.Native' -as [type]) { return }
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;

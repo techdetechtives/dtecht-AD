@@ -36,6 +36,8 @@ function Fail([string]$File, $Extent, [string]$Why) {
     $failures.Add(('{0}:{1}  {2}' -f $File, $line, $Why))
 }
 
+$packaged = @('dtecht-AD.ps1', 'dtecht-AD.psm1')            # build output = all sources inline
+
 # ---- 1. Command allowlist ----
 $readOnlyCommands = @(
     'Where-Object', 'Select-Object', 'Sort-Object', 'Group-Object', 'Measure-Object', 'ForEach-Object',
@@ -45,6 +47,8 @@ $readOnlyCommands = @(
     'Write-Host', 'Write-Progress', 'Write-Warning', 'Write-Verbose', 'Write-Output',
     'Out-Host', 'Out-Null', 'Out-String', 'Format-Table', 'Start-Sleep'
 )
+# Runner/module-only: opens the local report (-OpenReport) and exports the module command
+$runnerOnlyCommands = @{ 'Invoke-Item' = @('Invoke-ADAudit.ps1'); 'Set-Alias' = @('dtecht-AD.psm1'); 'Export-ModuleMember' = @('dtecht-AD.psm1') }
 $localWriteCommands = @('New-Item', 'Export-Csv', 'Out-File')   # report output only
 $localWriteAllowedIn = @('Invoke-ADAudit.ps1')
 $toolPrefixes = '-ADAudit'
@@ -66,7 +70,8 @@ $deniedTypes = 'Microsoft\.Win32\.Registry|System\.Management\.Management(Class|
 # ---- 5. Native APIs ----
 $allowedNative = @('NetLocalGroupGetMembers', 'NetShareEnum', 'NetApiBufferFree', 'LookupAccountSid')
 
-$files = Get-ChildItem -Path $Root -Recurse -Filter '*.ps1' | Where-Object { $_.FullName -notmatch '[\\/]tests[\\/]' }
+# Everything that ships is checked, including the packaged files in dist/. build/ and tests/ are dev tooling.
+$files = Get-ChildItem -Path $Root -Recurse -Include '*.ps1', '*.psm1' | Where-Object { $_.FullName -notmatch '[\\/](tests|build|\.git)[\\/]' }
 $ownFunctions = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 $asts = @{}
 foreach ($f in $files) {
@@ -82,6 +87,25 @@ foreach ($f in $files) {
     if (-not $ast) { continue }
     $name = $f.Name
 
+    # Packaged files (dist/) contain every source inline between '#region <path>' markers.
+    # Map each line back to its source file so per-file rules apply exactly as in the repo;
+    # the '#region runner' block counts as Invoke-ADAudit.ps1.
+    $regionOf = @{}
+    if ($packaged -contains $name) {
+        $lines = $ast.Extent.Text -split "`r?`n"
+        $cur = $name
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^#region (lib|Scanners)/(\S+\.ps1)$') { $cur = $Matches[2] }
+            elseif ($lines[$i] -match '^#region runner$') { $cur = 'Invoke-ADAudit.ps1' }
+            elseif ($lines[$i] -match '^#endregion ') { $regionOf[$i + 1] = $cur; $cur = $name; continue }
+            $regionOf[$i + 1] = $cur
+        }
+    }
+    function SrcName($extent) {
+        if ($regionOf.Count -and $extent -and $regionOf.ContainsKey($extent.StartLineNumber)) { return $regionOf[$extent.StartLineNumber] }
+        return $name
+    }
+
     foreach ($c in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
         $cmd = $c.GetCommandName()
         if (-not $cmd) {
@@ -93,8 +117,12 @@ foreach ($f in $files) {
             continue
         }
         if ($readOnlyCommands -contains $cmd -or $ownFunctions.Contains($cmd) -or $cmd -like "*$toolPrefixes*" -or $testHelpers -contains $cmd) { continue }
+        if ($runnerOnlyCommands.ContainsKey($cmd)) {
+            if ($runnerOnlyCommands[$cmd] -notcontains (SrcName $c.Extent)) { Fail $name $c.Extent "'$cmd' only allowed in $($runnerOnlyCommands[$cmd] -join ', ')" }
+            continue
+        }
         if ($localWriteCommands -contains $cmd) {
-            if ($localWriteAllowedIn -notcontains $name) { Fail $name $c.Extent "Local write command '$cmd' outside the report stage" }
+            if ($localWriteAllowedIn -notcontains (SrcName $c.Extent)) { Fail $name $c.Extent "Local write command '$cmd' outside the report stage" }
             continue
         }
         Fail $name $c.Extent "Command not on read-only allowlist: $cmd"
@@ -104,7 +132,7 @@ foreach ($f in $files) {
         $mn = $m.Member.Extent.Text.Trim("'", '"')
         if ($mn -eq 'Create' -and $m.Static -and $m.Expression.Extent.Text -in '[powershell]', '[runspacefactory]') { continue }   # local runspace
         if ($deniedMethods -contains $mn) { Fail $name $m.Extent "Write-capable method: .$mn()" }
-        if ($writeOnlyIn.ContainsKey($mn) -and $writeOnlyIn[$mn] -notcontains $name) { Fail $name $m.Extent ".$mn() only allowed in $($writeOnlyIn[$mn] -join ', ')" }
+        if ($writeOnlyIn.ContainsKey($mn) -and $writeOnlyIn[$mn] -notcontains (SrcName $m.Extent)) { Fail $name $m.Extent ".$mn() only allowed in $($writeOnlyIn[$mn] -join ', ')" }
         if ($mn -in 'Add', 'Clear', 'Remove', 'Insert', 'AddRange' -and $m.Expression.Extent.Text -match '\.(Children|Properties)(\[|$|\.)') { Fail $name $m.Extent "Modifies directory entry: $($m.Extent.Text)" }
     }
 
@@ -120,17 +148,23 @@ foreach ($f in $files) {
     foreach ($no in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'New-Object' }, $true)) {
         $typeArg = ($no.CommandElements | Select-Object -Skip 1 | Where-Object { $_ -isnot [System.Management.Automation.Language.CommandParameterAst] } | Select-Object -First 1).Extent.Text
         if ($typeArg -match $deniedTypes) { Fail $name $no.Extent "Write-capable type: $typeArg" }
-        if ($typeArg -match 'DirectoryServices\.DirectoryEntry' -and $name -ne 'Common.ps1') { Fail $name $no.Extent 'DirectoryEntry created outside lib/Common.ps1' }
+        if ($typeArg -match 'DirectoryServices\.DirectoryEntry' -and (SrcName $no.Extent) -ne 'Common.ps1') { Fail $name $no.Extent 'DirectoryEntry created outside lib/Common.ps1' }
     }
 
-    if ($name -eq 'Native.ps1') {
+    if ($name -in @('Native.ps1') + $packaged) {
         foreach ($mm in [regex]::Matches($text, 'static\s+extern\s+\w+\s+(\w+)\s*\(')) {
             if ($allowedNative -notcontains $mm.Groups[1].Value) { Fail $name $null "Native API not on read-only list: $($mm.Groups[1].Value)" }
         }
     }
     elseif ($text -match 'DllImport') { Fail $name $null 'DllImport outside lib/Native.ps1' }
+    if ($packaged -contains $name) {
+        foreach ($mm in [regex]::Matches($text, 'DllImport')) {
+            $ln = ($text.Substring(0, $mm.Index) -split "`n").Count
+            if ($regionOf[$ln] -ne 'Native.ps1') { Fail $name $null "DllImport outside the lib/Native.ps1 region (line $ln)" }
+        }
+    }
 
-    if ($name -eq 'Common.ps1') {
+    if ($name -in @('Common.ps1') + $packaged) {
         if ($text -notmatch "AuthenticationTypes\]'[^']*ReadonlyServer") { Fail $name $null 'LDAP bind does not request ReadonlyServer' }
         if ($text -match 'SecurityMasks\][^\r\n]*Sacl') { Fail $name $null 'SACL read requested (needs SeSecurityPrivilege; not needed)' }
     }
