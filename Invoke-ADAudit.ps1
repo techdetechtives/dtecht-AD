@@ -32,7 +32,9 @@
         LocalAdmin     - members of BUILTIN\Administrators
         Share          - shares, and which share roots the scanning account can list
 
-    Nothing is written to AD or to scanned hosts. LDAP auth can use -Credential;
+    READ-ONLY: nothing is written to AD, DCs or scanned hosts. The only files written
+    are the reports in -OutputPath on this machine (local paths only). tests/Test-ReadOnly.ps1
+    checks the code for write-capable calls. LDAP auth can use -Credential;
     per-host scanners always use the current Windows logon (use runas /netonly
     to scan as a different domain account).
 
@@ -98,7 +100,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $here 'lib\Common.ps1')
-. (Join-Path $here 'lib\Native.ps1')
+# netapi32 helpers (NetLocalGroupGetMembers / NetShareEnum, read-only) are only compiled when needed
+if ($Scanners -contains 'LocalAdmin' -or $Scanners -contains 'Share') { . (Join-Path $here 'lib\Native.ps1') }
 . (Join-Path $here 'lib\Acl.ps1')
 . (Join-Path $here 'lib\Compare.ps1')
 . (Join-Path $here 'lib\Remediation.ps1')
@@ -106,6 +109,11 @@ Get-ChildItem -Path (Join-Path $here 'Scanners') -Filter '*.ps1' | ForEach-Objec
 
 $adScanners = @($Scanners | Where-Object { $_ -in 'DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'DomainControllers', 'AuditPolicy', 'Permissions' })
 $hostScanners = @($Scanners | Where-Object { $_ -in 'Spooler', 'Smb', 'LocalAdmin', 'Share' })
+# Reports stay on this machine: refuse network paths so nothing is written to a DC, share or scanned host
+if ($OutputPath -match '^(\\\\|//)' -or ($OutputPath -match '^[A-Za-z]:' -and ([System.IO.DriveInfo]::new($OutputPath.Substring(0, 1))).DriveType -eq 'Network')) {
+    throw "-OutputPath must be a local folder (got '$OutputPath'). Copy the reports elsewhere afterwards."
+}
+
 $results = New-Object System.Collections.ArrayList
 $started = Get-Date
 

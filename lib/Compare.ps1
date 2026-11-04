@@ -61,6 +61,23 @@ function New-ADAuditChange {
     }
 }
 
+function Test-ADAuditPrivMemberRow { param($r) return ($r.Scanner -eq 'Groups' -and $r.Check -eq 'PrivilegedMember') }
+
+function Get-ADAuditFindingIndex {
+    # key (scanner|target|normalised issue) -> first matching row/issue
+    param([object[]]$Rows)
+    $h = @{}
+    foreach ($r in $Rows) {
+        if (($r.Scanner -eq 'DomainPolicy') -or (Test-ADAuditPrivMemberRow $r) -or ($r.Severity -in 'OK', 'Error') -or (-not $r.Finding)) { continue }
+        foreach ($i in (Get-ADAuditIssue -Row $r)) {
+            if ($i.Severity -in 'OK', 'Error') { continue }
+            $key = "$($r.Scanner)|$($r.Target)|$(ConvertTo-ADAuditIssueKey $i.Issue)".ToLowerInvariant()
+            if (-not $h.ContainsKey($key)) { $h[$key] = [pscustomobject]@{ Row = $r; Issue = $i.Issue; Severity = $i.Severity } }
+        }
+    }
+    return $h
+}
+
 function Compare-ADAuditRun {
     [CmdletBinding()]
     param(
@@ -78,9 +95,8 @@ function Compare-ADAuditRun {
     $cur = @($Current | Where-Object { $_.Scanner -in $both })
 
     # --- Privileged group membership ---
-    $isPm = { param($r) $r.Scanner -eq 'Groups' -and $r.Check -eq 'PrivilegedMember' }
-    $pPm = @{}; foreach ($r in $prev) { if (& $isPm $r) { $pPm["$($r.Group)|$($r.DistinguishedName)".ToLowerInvariant()] = $r } }
-    $cPm = @{}; foreach ($r in $cur) { if (& $isPm $r) { $cPm["$($r.Group)|$($r.DistinguishedName)".ToLowerInvariant()] = $r } }
+    $pPm = @{}; foreach ($r in $prev) { if (Test-ADAuditPrivMemberRow $r) { $pPm["$($r.Group)|$($r.DistinguishedName)".ToLowerInvariant()] = $r } }
+    $cPm = @{}; foreach ($r in $cur) { if (Test-ADAuditPrivMemberRow $r) { $cPm["$($r.Group)|$($r.DistinguishedName)".ToLowerInvariant()] = $r } }
     foreach ($k in $cPm.Keys) {
         if (-not $pPm.ContainsKey($k)) {
             $r = $cPm[$k]
@@ -106,22 +122,8 @@ function Compare-ADAuditRun {
     }
 
     # --- Individual findings ---
-    $skip = { param($r) ($r.Scanner -eq 'DomainPolicy') -or (& $isPm $r) -or ($r.Severity -in 'OK', 'Error') -or (-not $r.Finding) }
-    $index = {
-        param($rows)
-        $h = @{}
-        foreach ($r in $rows) {
-            if (& $skip $r) { continue }
-            foreach ($i in (Get-ADAuditIssue -Row $r)) {
-                if ($i.Severity -in 'OK', 'Error') { continue }
-                $key = "$($r.Scanner)|$($r.Target)|$(ConvertTo-ADAuditIssueKey $i.Issue)".ToLowerInvariant()
-                if (-not $h.ContainsKey($key)) { $h[$key] = [pscustomobject]@{ Row = $r; Issue = $i.Issue; Severity = $i.Severity } }
-            }
-        }
-        $h
-    }
-    $pF = & $index $prev
-    $cF = & $index $cur
+    $pF = Get-ADAuditFindingIndex -Rows $prev
+    $cF = Get-ADAuditFindingIndex -Rows $cur
 
     # Which host-scanner targets were actually scanned this time?
     $scannedNow = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)

@@ -14,11 +14,18 @@ function Join-ADAuditLdapPath {
 }
 
 function New-ADAuditDirectoryEntry {
+    <#
+        Bind options: Secure (Kerberos/NTLM, no simple bind), Signing + Sealing (signed and
+        encrypted LDAP), ReadonlyServer (tells ADSI no write access is needed, so an RODC
+        or GC is acceptable). The entry is only ever used as a search root; nothing in this
+        tool calls CommitChanges / Put / Invoke on it (enforced by tests/Test-ReadOnly.ps1).
+    #>
     param([Parameter(Mandatory)][string]$Path, [pscredential]$Credential)
+    $auth = [System.DirectoryServices.AuthenticationTypes]'Secure, Signing, Sealing, ReadonlyServer'
     if ($Credential) {
-        return New-Object System.DirectoryServices.DirectoryEntry($Path, $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        return New-Object System.DirectoryServices.DirectoryEntry($Path, $Credential.UserName, $Credential.GetNetworkCredential().Password, $auth)
     }
-    return New-Object System.DirectoryServices.DirectoryEntry($Path)
+    return New-Object System.DirectoryServices.DirectoryEntry($Path, $null, $null, $auth)
 }
 
 function Get-ADAuditDefaultNamingContext {

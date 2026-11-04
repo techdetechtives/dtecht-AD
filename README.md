@@ -2,7 +2,20 @@
 
 Read-only PowerShell AD audit scanners, modeled on PingCastle's health-check rules and `--scanner` modules. No module dependencies (uses `System.DirectoryServices` and netapi32), Windows PowerShell 5.1 or PowerShell 7 on Windows.
 
-**Nothing is written to Active Directory or to scanned hosts.**
+**Read-only: nothing is written to Active Directory, DCs or scanned hosts.** The only files written are the reports in `-OutputPath`, which must be a local folder.
+
+### What touches other systems
+
+| Target | Calls | Writes |
+|---|---|---|
+| AD | LDAP searches only (signed + sealed bind, `ReadonlyServer`), owner + DACL of security descriptors | None |
+| DC Security log | `Get-WinEvent` queries | None |
+| SYSVOL | `Get-Content`, `Import-Csv`, `Get-Acl` on GPO files/folders | None |
+| Scanned hosts | TCP connect, SMB NEGOTIATE (no session), spooler pipe attributes, `NetLocalGroupGetMembers`, `NetShareEnum`, `LookupAccountSid`, one directory listing per share | None |
+
+`tests/Test-ReadOnly.ps1` enforces this. It parses every script and fails on any command outside a read-only allowlist (including external tools such as auditpol or net), any ADSI/registry/WMI/file write method, any assignment to directory entry properties, unexpected native APIs, or a DirectoryEntry created outside `lib/Common.ps1`. Run it before merging changes: `pwsh -File tests/Test-ReadOnly.ps1`.
+
+Side effects that every authenticated read causes: logon/Kerberos events on DCs and hosts, a bad-password count if `-Credential` is mistyped, and SMB1 audit event 3000 when that audit is on (`-SkipSmb1` avoids it).
 
 ## Quick start
 
