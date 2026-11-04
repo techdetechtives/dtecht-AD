@@ -2,6 +2,37 @@
 
 Read-only PowerShell AD audit scanners, modeled on PingCastle's health-check rules and `--scanner` modules. No module dependencies (uses `System.DirectoryServices` and netapi32), Windows PowerShell 5.1 or PowerShell 7 on Windows.
 
+## Simple usage
+
+The simplest way, no install needed:
+
+1. Copy **`dist/dtecht-AD.ps1`** to any domain-joined Windows machine.
+2. Open PowerShell in that folder and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\dtecht-AD.ps1 -Preset ADOnly -OpenReport
+```
+
+The report opens when the run finishes. All results are saved in a new `ADAudit-<date>` folder next to the script.
+
+**Common runs:**
+
+| You want | Command |
+|---|---|
+| AD checks only (safest, nothing sent to member computers) | `.\dtecht-AD.ps1 -Preset ADOnly -OpenReport` |
+| Everything | `.\dtecht-AD.ps1 -OpenReport` |
+| Only the domain controllers | `.\dtecht-AD.ps1 -Preset DCsOnly -OpenReport` |
+| What changed since last time | `.\dtecht-AD.ps1 -Preset ADOnly -Baseline .\ADAudit-20261104-1200` |
+
+**What you get in the report folder:**
+
+- **Summary.html:** the risk score (0–100, lower is better) and each issue with how to fix it.
+- **AllFindings.csv:** every issue, ready to sort and filter in Excel.
+
+Run it as a normal domain user; that's enough for the ADOnly run. It only reads, so nothing in AD or on any computer is changed.
+
+Once the module is on the PowerShell Gallery, you can skip the file copy: run `Install-Module dtecht-AD` once, then just `dtecht-ad -Preset ADOnly -OpenReport`.
+
 **Read-only: nothing is written to Active Directory, DCs or scanned hosts.** The only files written are the reports in `-OutputPath`, which must be a local folder.
 
 ### What touches other systems
