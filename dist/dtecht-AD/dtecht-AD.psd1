@@ -14,9 +14,10 @@
     VariablesToExport    = @()
     PrivateData          = @{
         PSData = @{
-            Tags       = @('ActiveDirectory', 'Security', 'Audit', 'BlueTeam', 'PingCastle', 'DCSync', 'Windows')
-            LicenseUri = 'https://github.com/techdetechtives/dtecht-AD/blob/main/LICENSE'
-            ProjectUri = 'https://github.com/techdetechtives/dtecht-AD'
+            Tags         = @('ActiveDirectory', 'Security', 'Audit', 'BlueTeam', 'PingCastle', 'DCSync', 'Windows', 'PSEdition_Desktop', 'PSEdition_Core')
+            LicenseUri   = 'https://github.com/techdetechtives/dtecht-AD/blob/main/LICENSE'
+            ProjectUri   = 'https://github.com/techdetechtives/dtecht-AD'
+            ReleaseNotes = 'Read-only AD audit. Run: dtecht-ad -Preset ADOnly -OpenReport. Changes: https://github.com/techdetechtives/dtecht-AD/commits/main'
         }
     }
 }

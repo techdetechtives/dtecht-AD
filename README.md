@@ -43,6 +43,13 @@ dtecht-ad -Preset ADOnly -OpenReport          # dtecht-ad is an alias of Invoke-
 Get-Help Invoke-DtechtAD -Full
 ```
 
+**4. From the PowerShell Gallery** (once published):
+
+```powershell
+Install-Module dtecht-AD -Scope CurrentUser
+dtecht-ad -Preset ADOnly -OpenReport
+```
+
 From a clone of this repo, `.\Invoke-ADAudit.ps1` works the same way.
 
 ### Presets
@@ -165,3 +172,16 @@ pwsh -File tests/Test-ReadOnly.ps1        # read-only guard
 pwsh -File build/Build-Package.ps1        # regenerate dist/dtecht-AD.ps1, the module and SHA256SUMS
 pwsh -File build/Build-Package.ps1 -Check # fails if dist/ is out of date
 ```
+
+### Publishing to the PowerShell Gallery (maintainers)
+
+1. Merge to `main`. Version comes from `$meta.Version` in `Invoke-ADAudit.ps1`; bump it and rebuild for every release.
+2. Create an API key at <https://www.powershellgallery.com/account/apikeys>: scope *Push new packages and package versions*, glob pattern `dtecht-AD`, short expiry.
+3. On a Windows machine with PowerShell 5.1+ (PSScriptAnalyzer recommended: `Install-Module PSScriptAnalyzer`):
+
+```powershell
+.\build\Publish-Gallery.ps1                                                   # dry run: all checks, no upload
+.\build\Publish-Gallery.ps1 -Publish -ApiKey (Read-Host 'API key' -AsSecureString)
+```
+
+The script refuses to publish unless it is on a clean `main`, `dist/` is up to date, the read-only guard and PSScriptAnalyzer pass, and the version isn't already on the Gallery. Warnings excluded on purpose are listed in `PSScriptAnalyzerSettings.psd1`.
