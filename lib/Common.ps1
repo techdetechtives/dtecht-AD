@@ -32,6 +32,26 @@ function Get-ADAuditDefaultNamingContext {
     finally { $rootDse.Dispose() }
 }
 
+function Get-ADAuditRootDse {
+    param([string]$Server, [pscredential]$Credential)
+    $rootDse = New-ADAuditDirectoryEntry -Path (Join-ADAuditLdapPath -Server $Server -DistinguishedName 'RootDSE') -Credential $Credential
+    try {
+        [pscustomobject]@{
+            DefaultNamingContext       = [string]$rootDse.Properties['defaultNamingContext'].Value
+            ConfigurationNamingContext = [string]$rootDse.Properties['configurationNamingContext'].Value
+            RootDomainNamingContext    = [string]$rootDse.Properties['rootDomainNamingContext'].Value
+            DnsHostName                = [string]$rootDse.Properties['dnsHostName'].Value
+        }
+    }
+    finally { $rootDse.Dispose() }
+}
+
+function Get-ADAuditParentDN {
+    # Strip the first (unescaped) RDN
+    param([string]$DistinguishedName)
+    return ($DistinguishedName -replace '^(?:[^,\\]|\\.)*,', '')
+}
+
 function Invoke-ADAuditLdapQuery {
     <#
         Paged LDAP search. Returns one PSCustomObject per entry with the requested
@@ -115,7 +135,8 @@ function Get-ADAuditComputer {
             OSVersion          = [string]$c.operatingSystemVersion
             LastLogonUtc       = $last
             IsStale            = $isStale
-            IsDomainController = (($uac -band 0x2000) -ne 0)   # SERVER_TRUST_ACCOUNT
+            IsDomainController = (($uac -band 0x2000) -ne 0) -or (($uac -band 0x4000000) -ne 0)   # SERVER_TRUST_ACCOUNT or RODC
+            IsReadOnly         = (($uac -band 0x4000000) -ne 0)                                    # PARTIAL_SECRETS_ACCOUNT
             DistinguishedName  = [string]$c.distinguishedName
             WhenCreated        = $c.whenCreated
         }

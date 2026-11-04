@@ -4,8 +4,9 @@
     Read-only Active Directory host and configuration scanners (PingCastle-style).
 
 .DESCRIPTION
-    Runs any combination of these scanners and writes one CSV per scanner, an
-    AllFindings.csv and a Summary.html to the output folder.
+    Runs any combination of these scanners and writes one CSV per scanner,
+    AllFindings.csv, results.json and Summary.html to the output folder.
+    With -Baseline it also writes Changes.csv: what changed since a previous run.
 
       AD-only (LDAP reads, nothing sent to hosts):
         DomainPolicy   - password/lockout policy, MachineAccountQuota, krbtgt age, Guest, Pre-Win2000 access
@@ -15,6 +16,12 @@
                          deep / circular group nesting
         OSInventory    - unsupported / soon-unsupported Windows versions, stale accounts
         LapsBitLocker  - LAPS (legacy + Windows LAPS) coverage, BitLocker key escrow
+        DomainControllers - DC inventory: site, IPs, OS, RODC/GC, FSMO roles, redundancy
+        AuditPolicy    - audit policy applied to DCs by GPO (read from SYSVOL), missing subcategories
+
+      Per-DC (read-only Security log query over RPC):
+        Events         - account / group / SID history / DSRM / delegation / ACL changes in the
+                         last -EventDays days, and how far back the Security log actually goes
 
       Per-host (read-only network queries over TCP 445):
         Spooler        - Print Spooler pipe reachable (critical on DCs)
@@ -39,12 +46,20 @@
     Check only DCs for SMB and Spooler issues.
 
 .EXAMPLE
+    .\Invoke-ADAudit.ps1 -Baseline .\ADAudit-20261101-090000
+    Full run, plus Changes.csv / a "Changes since baseline" section comparing against an earlier run.
+
+.EXAMPLE
+    .\Invoke-ADAudit.ps1 -Scanners Events,AuditPolicy -EventDays 30
+    Review the last 30 days of account and group changes on every DC.
+
+.EXAMPLE
     .\Invoke-ADAudit.ps1 -ComputerName srv01.corp.local,srv02.corp.local -Scanners Share,LocalAdmin
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'Spooler', 'Smb', 'LocalAdmin', 'Share')]
-    [string[]]$Scanners = @('DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'Spooler', 'Smb', 'LocalAdmin', 'Share'),
+    [ValidateSet('DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'DomainControllers', 'AuditPolicy', 'Events', 'Spooler', 'Smb', 'LocalAdmin', 'Share')]
+    [string[]]$Scanners = @('DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'DomainControllers', 'AuditPolicy', 'Events', 'Spooler', 'Smb', 'LocalAdmin', 'Share'),
 
     [string]$Server,
     [string]$SearchBase,
@@ -64,6 +79,13 @@ param(
     [ValidateRange(250, 60000)][int]$NetworkTimeoutMs = 3000,
     [switch]$SkipSmb1,
 
+    # Events scanner
+    [ValidateRange(1, 365)][int]$EventDays = 7,
+    [ValidateRange(100, 1000000)][int]$EventMaxPerDC = 5000,
+
+    # Previous run folder (or its results.json) to compare against
+    [string]$Baseline,
+
     [string]$OutputPath = (Join-Path -Path (Get-Location) -ChildPath ("ADAudit-" + (Get-Date -Format 'yyyyMMdd-HHmmss')))
 )
 
@@ -71,11 +93,20 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $here 'lib\Common.ps1')
 . (Join-Path $here 'lib\Native.ps1')
+. (Join-Path $here 'lib\Compare.ps1')
 Get-ChildItem -Path (Join-Path $here 'Scanners') -Filter '*.ps1' | ForEach-Object { . $_.FullName }
 
-$adScanners = @($Scanners | Where-Object { $_ -in 'DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker' })
+$adScanners = @($Scanners | Where-Object { $_ -in 'DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'DomainControllers', 'AuditPolicy' })
 $hostScanners = @($Scanners | Where-Object { $_ -in 'Spooler', 'Smb', 'LocalAdmin', 'Share' })
 $results = New-Object System.Collections.ArrayList
+$started = Get-Date
+
+# Load the baseline first so a bad path fails before a long scan
+$baselineRun = $null
+if ($Baseline) {
+    $baselineRun = Read-ADAuditRun -Path $Baseline
+    Write-Host ("[+] Baseline: {0} ({1} results)" -f $baselineRun.Meta.Generated, @($baselineRun.Results).Count)
+}
 
 # ---------- AD inventory ----------
 $allComputers = @()
@@ -93,7 +124,7 @@ $adScope = $allComputers
 if ($DomainControllersOnly) { $adScope = @($allComputers | Where-Object { $_.IsDomainController }) }
 
 $groupInventory = $null; $privileged = $null
-if ($Scanners -contains 'Accounts' -or $Scanners -contains 'Groups') {
+if ($Scanners -contains 'Accounts' -or $Scanners -contains 'Groups' -or $Scanners -contains 'Events') {
     Write-Host "[*] Resolving privileged group membership (direct + nested)..."
     $groupInventory = @(Get-ADAuditGroupInventory -Server $Server -SearchBase $SearchBase -Credential $Credential)
     $privileged = Get-ADAuditPrivilegedMembership -Groups $groupInventory -Server $Server -SearchBase $SearchBase -Credential $Credential
@@ -109,10 +140,32 @@ foreach ($s in $adScanners) {
             'Groups' { Invoke-ADAuditGroupScan -Groups $groupInventory -Privileged $privileged -MaxNestingDepth $MaxNestingDepth }
             'OSInventory' { Invoke-ADAuditOSInventory -Computers $adScope }
             'LapsBitLocker' { Invoke-ADAuditLapsBitLocker -Computers $adScope -Server $Server -SearchBase $SearchBase -Credential $Credential }
+            'DomainControllers' { Invoke-ADAuditDomainControllerScan -Computers $allComputers -Server $Server -Credential $Credential }
+            'AuditPolicy' { Invoke-ADAuditAuditPolicyScan -Server $Server -Credential $Credential }
         }
         foreach ($o in $out) { [void]$results.Add($o) }
     }
     catch { [void]$results.Add((New-ADAuditResult -Scanner $s -Computer '(domain)' -Severity 'Error' -Finding $_.Exception.Message)) }
+}
+
+# ---------- DC Security log ----------
+if ($Scanners -contains 'Events') {
+    $dcTargets = @($allComputers | Where-Object { $_.IsDomainController -and -not $_.IsStale })
+    if ($ComputerName) { $dcTargets = @($dcTargets | Where-Object { $ComputerName -contains $_.Name -or $ComputerName -contains $_.DnsHostName }) }
+    $privSids = @{}; $privNames = @{}
+    if ($privileged) {
+        foreach ($g in $privileged.Groups) { if ($g.Sid) { $privSids[$g.Sid] = $g.Label } }
+        foreach ($m in $privileged.Members) { if ($m.MemberName) { $privNames[$m.MemberName] = $true } }
+    }
+    $domainDn = $null
+    try { $domainDn = Get-ADAuditDefaultNamingContext -Server $Server -Credential $Credential } catch { }
+    Write-Host ("[*] Reading Security logs on {0} DCs (last {1} days)..." -f $dcTargets.Count, $EventDays)
+    foreach ($dc in $dcTargets) {
+        try {
+            foreach ($o in (Invoke-ADAuditEventScan -ComputerName $dc.DnsHostName -EventDays $EventDays -MaxEvents $EventMaxPerDC -PrivilegedSids $privSids -PrivilegedNames $privNames -DomainDN $domainDn -TimeoutMs $NetworkTimeoutMs)) { [void]$results.Add($o) }
+        }
+        catch { [void]$results.Add((New-ADAuditResult -Scanner 'Events' -Target $dc.DnsHostName -Severity 'Error' -Finding $_.Exception.Message)) }
+    }
 }
 
 # ---------- Per-host scanners ----------
@@ -228,8 +281,34 @@ function ConvertTo-ADAuditFlatRow {
 }
 
 $all = @($results)
+$flat = New-Object System.Collections.ArrayList
 foreach ($g in ($all | Group-Object Scanner)) {
-    ConvertTo-ADAuditFlatRow -Rows $g.Group | Export-Csv -Path (Join-Path $OutputPath "$($g.Name).csv") -NoTypeInformation -Encoding UTF8
+    $rows = @(ConvertTo-ADAuditFlatRow -Rows $g.Group)
+    $rows | Export-Csv -Path (Join-Path $OutputPath "$($g.Name).csv") -NoTypeInformation -Encoding UTF8
+    foreach ($r in $rows) { [void]$flat.Add($r) }
+}
+
+# results.json (machine-readable; also the input for a later -Baseline)
+$domainName = $null
+try { $domainName = ConvertTo-ADAuditDnsName (Get-ADAuditDefaultNamingContext -Server $Server -Credential $Credential) } catch { }
+$meta = [ordered]@{
+    Tool        = 'dtecht-AD'
+    Version     = '1.1.0'
+    Generated   = $started.ToString('yyyy-MM-ddTHH:mm:sszzz')
+    DurationSec = [int]((Get-Date) - $started).TotalSeconds
+    Domain      = $domainName
+    RunAs       = "$env:USERDOMAIN\$env:USERNAME"
+    Host        = $env:COMPUTERNAME
+    Scanners    = @($Scanners)
+    Parameters  = [ordered]@{ ActiveDays = $ActiveDays; PasswordAgeDays = $PasswordAgeDays; MaxGroupMemberships = $MaxGroupMemberships; MaxNestingDepth = $MaxNestingDepth; EventDays = $EventDays; DomainControllersOnly = [bool]$DomainControllersOnly; ComputerName = @($ComputerName) }
+}
+[ordered]@{ Meta = $meta; Results = @($flat) } | ConvertTo-Json -Depth 6 | Out-File -FilePath (Join-Path $OutputPath 'results.json') -Encoding UTF8
+
+# Changes since baseline
+$changes = @()
+if ($baselineRun) {
+    $changes = @(Compare-ADAuditRun -Previous @($baselineRun.Results) -Current @($flat) -PreviousScanners @($baselineRun.Meta.Scanners) -CurrentScanners $Scanners)
+    $changes | Export-Csv -Path (Join-Path $OutputPath 'Changes.csv') -NoTypeInformation -Encoding UTF8
 }
 $findings = @($all | Where-Object { $_.Severity -notin 'OK' } | Select-Object Scanner, Target, Severity, Finding)
 $findings | Export-Csv -Path (Join-Path $OutputPath 'AllFindings.csv') -NoTypeInformation -Encoding UTF8
@@ -255,8 +334,14 @@ th { background: #f3f5f7; }
 .meta { color: #57606a; font-size: 13px; }
 </style>
 '@
-$meta = "<p class='meta'>Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by $env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME &middot; Scanners: $($Scanners -join ', ')</p>"
-$body = "<h1>AD Audit Summary</h1>$meta<h2>Results by scanner</h2>" +
+$metaHtml = "<p class='meta'>Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') by $env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME &middot; Scanners: $($Scanners -join ', ')</p>"
+$changesHtml = ''
+if ($baselineRun) {
+    $chSorted = $changes | Sort-Object @{ Expression = { $sevOrder.IndexOf($_.Severity) } }, Change, Scanner, Target
+    $changesHtml = "<h2>Changes since baseline $($baselineRun.Meta.Generated) ($(@($changes).Count))</h2>" +
+        $(if ($chSorted) { ($chSorted | ConvertTo-Html -Fragment) } else { '<p>No changes.</p>' })
+}
+$body = "<h1>AD Audit Summary</h1>$metaHtml" + $changesHtml + "<h2>Results by scanner</h2>" +
     ($matrix | ConvertTo-Html -Fragment) +
     "<h2>High and Medium findings ($(@($top).Count))</h2>" +
     $(if ($top) { ($top | ConvertTo-Html -Fragment) } else { '<p>None.</p>' })
@@ -264,4 +349,9 @@ ConvertTo-Html -Title 'AD Audit Summary' -Head $css -Body $body | Out-File -File
 
 Write-Host ""
 $matrix | Format-Table -AutoSize | Out-Host
+if ($baselineRun) {
+    Write-Host ("[+] Changes since baseline: {0} ({1} New, {2} Resolved, {3} Added to privileged groups, {4} Removed, {5} policy changes)" -f @($changes).Count,
+        @($changes | Where-Object Change -eq 'New').Count, @($changes | Where-Object Change -eq 'Resolved').Count,
+        @($changes | Where-Object Change -eq 'Added').Count, @($changes | Where-Object Change -eq 'Removed').Count, @($changes | Where-Object Change -eq 'Changed').Count)
+}
 Write-Host "[+] Results written to $OutputPath"
