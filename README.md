@@ -113,3 +113,11 @@ A simple routine: run weekly as a scheduled task with `-Baseline` pointing at th
 - AuditPolicy can't see GPOs linked to AD sites, local policy, or `auditpol` changes made by hand. To confirm on a DC: `auditpol /get /category:*`.
 - If DCs already forward Security logs to a SIEM (e.g. TechDetechtives via Winlogbeat), do real-time detection there. Use the Events scanner for periodic review and to check log coverage.
 - Enterprise/Schema Admins live in the forest root domain. When you scan a child domain, run it again against the root (`-Server rootdc`) to cover them.
+
+## Authorized use
+
+Run dtecht-AD only against Active Directory environments you own or are explicitly authorized to audit. Reports contain sensitive data about your domain (admin accounts, permissions, weaknesses), so store and share them accordingly. The `.gitignore` keeps report output out of git.
+
+## License
+
+MIT - see [LICENSE](LICENSE). Some checks are inspired by [PingCastle](https://github.com/netwrix/pingcastle), [EthicalInsight](https://github.com/AlchemiistCreative/EthicalInsight) and [AD_Miner](https://github.com/AD-Security/AD_Miner); no code from those projects is included.
