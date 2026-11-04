@@ -12,7 +12,7 @@
 
 function Invoke-ADAuditDomainPolicyScan {
     [CmdletBinding()]
-    param([string]$Server, [pscredential]$Credential, [int]$KrbtgtMaxAgeDays = 180)
+    param([string]$Server, [pscredential]$Credential, [int]$KrbtgtMaxAgeDays = 180, $Privileged, [int]$AdminMinPasswordLength = 14)
 
     $nc = Get-ADAuditDefaultNamingContext -Server $Server -Credential $Credential
     $domain = ConvertTo-ADAuditDnsName $nc
@@ -51,9 +51,33 @@ function Invoke-ADAuditDomainPolicyScan {
     $flName = $(if ($levels.ContainsKey($fl)) { $levels[$fl] } else { "$fl" })
     Out-Setting 'DomainFunctionalLevel' $flName $(if ($fl -lt 6) { 'Low' } else { 'Info' }) $(if ($fl -lt 6) { "Functional level $flName blocks newer protections (e.g. Protected Users DC-side)" } else { '' })
 
+    # Fine-grained password policies: one row each, and whether admins get a stronger policy
     try {
-        $pso = @(Invoke-ADAuditLdapQuery -Server $Server -SearchBase "CN=Password Settings Container,CN=System,$nc" -Credential $Credential -Filter '(objectClass=msDS-PasswordSettings)' -Properties 'name')
-        Out-Setting 'FineGrainedPasswordPolicies' $pso.Count 'Info' $(if ($pso.Count -gt 0) { ($pso.name -join ', ') } else { 'None (or not readable)' })
+        $psoProps = 'name', 'msDS-PasswordSettingsPrecedence', 'msDS-MinimumPasswordLength', 'msDS-LockoutThreshold', 'msDS-PasswordReversibleEncryptionEnabled', 'msDS-PSOAppliesTo'
+        $pso = @(Invoke-ADAuditLdapQuery -Server $Server -SearchBase "CN=Password Settings Container,CN=System,$nc" -Credential $Credential -Filter '(objectClass=msDS-PasswordSettings)' -Properties $psoProps)
+        Out-Setting 'FineGrainedPasswordPolicies' $pso.Count 'Info' $(if ($pso.Count -gt 0) { (($pso | ForEach-Object { $_.name }) -join ', ') } else { 'None (or not readable)' })
+
+        # DNs that make a PSO an "admin" policy: privileged global groups (PSOs only apply via global groups) and privileged accounts
+        $adminDns = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        if ($Privileged) {
+            foreach ($g in $Privileged.Groups) { if ($g.Label -in 'Domain Admins', 'Enterprise Admins', 'Schema Admins') { [void]$adminDns.Add($g.DistinguishedName) } }
+            foreach ($m in $Privileged.Members) { [void]$adminDns.Add($m.MemberDN) }
+        }
+        $adminCovered = $false
+        foreach ($p in $pso) {
+            $applies = @($p.'msDS-PSOAppliesTo' | Where-Object { $_ } | ForEach-Object { [string]$_ })
+            $forAdmins = @($applies | Where-Object { $adminDns.Contains($_) }).Count -gt 0
+            if ($forAdmins) { $adminCovered = $true }
+            $len = [int]$p.'msDS-MinimumPasswordLength'
+            $rev = "$($p.'msDS-PasswordReversibleEncryptionEnabled')" -eq 'True'
+            $val = 'precedence {0}, min length {1}, lockout {2}, applies to {3}' -f $p.'msDS-PasswordSettingsPrecedence', $len, $p.'msDS-LockoutThreshold', $applies.Count
+            if ($rev) { Out-Setting "FGPP:$($p.name)" $val 'High' 'Fine-grained policy enables reversible password encryption' }
+            elseif ($forAdmins -and $len -lt $AdminMinPasswordLength) { Out-Setting "FGPP:$($p.name)" $val 'Medium' "Admin fine-grained policy minimum length is $len (recommend $AdminMinPasswordLength+)" }
+            else { Out-Setting "FGPP:$($p.name)" $val $(if ($applies.Count -eq 0) { 'Low' } else { 'Info' }) $(if ($applies.Count -eq 0) { 'Fine-grained policy applies to nothing' } elseif ($forAdmins) { 'Applies to admins' } else { '' }) }
+        }
+        if ($Privileged -and -not $adminCovered -and $minLen -lt $AdminMinPasswordLength) {
+            Out-Setting 'AdminPasswordPolicy' "default (min $minLen)" 'Low' "Admins only have the default password policy (min length $minLen) - add a fine-grained policy for admin groups"
+        }
     }
     catch { Out-Setting 'FineGrainedPasswordPolicies' $null 'Info' 'Not readable' }
 

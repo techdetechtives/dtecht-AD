@@ -102,6 +102,7 @@ function Invoke-ADAuditDomainControllerScan {
             IsGlobalCatalog = $isGc
             FsmoRoles       = ($dcRoles -join ', ')
             LastLogonUtc    = $dc.LastLogonUtc
+            IssueSeverity = (@($sev) -join ';')
         })
     }
 

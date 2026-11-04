@@ -12,6 +12,8 @@
       Too many group memberships (> -MaxGroupMemberships), SID history, orphaned adminCount
       Privileged accounts not 'sensitive and cannot be delegated' / not in Protected Users
       Password-like text in the description field
+      Cleartext password attributes (userPassword, unixUserPassword, msSFU30Password, os400Password)
+      Unexpected primaryGroupID (hidden group membership) on users and computers
 
     Only accounts with at least one issue, plus all privileged and service accounts,
     are written out (so the CSV doubles as a privileged/service account inventory).
@@ -33,8 +35,10 @@ function Invoke-ADAuditAccountScan {
 
     $now = [DateTime]::UtcNow
     $props = 'sAMAccountName', 'displayName', 'distinguishedName', 'userAccountControl', 'lastLogonTimestamp', 'pwdLastSet',
-             'whenCreated', 'servicePrincipalName', 'memberOf', 'adminCount', 'sIDHistory', 'description', 'msDS-AllowedToDelegateTo'
+             'whenCreated', 'servicePrincipalName', 'memberOf', 'adminCount', 'sIDHistory', 'description', 'msDS-AllowedToDelegateTo',
+             'primaryGroupID', 'objectSid', 'userPassword', 'unixUserPassword', 'msSFU30Password', 'os400Password'
     $filter = '(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
+    $privilegedRids = 512, 516, 518, 519, 520, 521, 526, 527, 498
     # Adds to the $sev / $issues lists of the current loop iteration (dynamic scope)
     function Add-Issue([string]$s, [string]$t) { $sev.Add($s); $issues.Add($t) }
 
@@ -91,6 +95,16 @@ function Invoke-ADAuditAccountScan {
             if ((($uac -band 0x100000) -eq 0) -and -not $isProtected) { Add-Issue 'Medium' "Privileged account not marked 'sensitive and cannot be delegated'" }
         }
         if ("$($u.description)" -match '(?i)\b(pass(word)?|pwd|p/w|kennwort|mot de passe)\b\s*[:=]?') { Add-Issue 'Medium' 'Description may contain a password' }
+        foreach ($a in 'userPassword', 'unixUserPassword', 'msSFU30Password', 'os400Password') {
+            if ($null -ne $u.$a -and "$($u.$a)" -ne '') { Add-Issue 'High' "Cleartext password stored in $a attribute" }
+        }
+        $pgid = $(if ($null -ne $u.primaryGroupID) { [int]$u.primaryGroupID } else { 513 })
+        $rid = $(if ((ConvertTo-ADAuditSidString $u.objectSid) -match '-(\d+)$') { [int64]$Matches[1] } else { 0 })
+        $expectedPg = $(if ($rid -eq 501) { 514 } else { 513 })   # Guest -> Domain Guests
+        if ($pgid -ne $expectedPg -and $pgid -ne 513) {
+            if ($pgid -in $privilegedRids) { Add-Issue 'High' "Primary group is privileged (RID $pgid) - hidden membership" }
+            else { Add-Issue 'Low' "Unexpected primaryGroupID $pgid" }
+        }
 
         if ($issues.Count -eq 0 -and -not $isPriv -and -not $isSvc) { continue }
 
@@ -109,8 +123,24 @@ function Invoke-ADAuditAccountScan {
             GroupCount           = $groups.Count
             SPNs                 = ($spns -join '; ')
             Description          = [string]$u.description
+            PrimaryGroupId       = $pgid
             DistinguishedName    = $dn
+            IssueSeverity        = (@($sev) -join ';')
         })
+    }
+
+    # Computers whose primaryGroupID doesn't match their type (515 member, 516 DC, 521 RODC)
+    $pf = '(&(objectCategory=computer)(!(primaryGroupID=515))(!(primaryGroupID=516))(!(primaryGroupID=521)))'
+    $cf = '(&(objectCategory=computer)(|(&(primaryGroupID=516)(!(userAccountControl:1.2.840.113556.1.4.803:=8192)))(&(primaryGroupID=521)(!(userAccountControl:1.2.840.113556.1.4.803:=67108864)))))'
+    foreach ($q in @($pf, $cf)) {
+        foreach ($c in (Invoke-ADAuditLdapQuery -Server $Server -SearchBase $SearchBase -Credential $Credential -Filter $q -Properties 'sAMAccountName', 'distinguishedName', 'primaryGroupID')) {
+            $pg = [int]$c.primaryGroupID
+            $sev1 = $(if ($pg -in $privilegedRids) { 'High' } else { 'Low' })
+            $txt = $(if ($pg -in 516, 521) { "Non-DC computer has DC primaryGroupID $pg" } elseif ($sev1 -eq 'High') { "Primary group is privileged (RID $pg) - hidden membership" } else { "Unexpected primaryGroupID $pg" })
+            New-ADAuditResult -Scanner 'Accounts' -Target ([string]$c.sAMAccountName) -Severity $sev1 -Finding $txt -Data ([ordered]@{
+                ObjectType = 'computer'; PrimaryGroupId = $pg; DistinguishedName = [string]$c.distinguishedName
+            })
+        }
     }
 
     # Non-DC computers with unconstrained delegation (DC = 0x2000, RODC = 0x4000000)

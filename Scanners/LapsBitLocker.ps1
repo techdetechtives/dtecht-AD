@@ -90,6 +90,7 @@ function Invoke-ADAuditLapsBitLocker {
             BitLockerRecoveryObj = $(if ($blVisible) { $blCount } else { $null })
             IsStale              = $c.IsStale
             Note                 = $(if (-not $blVisible) { $blNote } else { $null })
+            IssueSeverity = (@($sev) -join ';')
         })
     }
 }

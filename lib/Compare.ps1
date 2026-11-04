@@ -15,7 +15,7 @@
     is not compared.
 #>
 
-$script:ADAuditAdScannerNames = @('DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'AuditPolicy', 'DomainControllers')
+$script:ADAuditAdScannerNames = @('DomainPolicy', 'Accounts', 'Groups', 'OSInventory', 'LapsBitLocker', 'AuditPolicy', 'DomainControllers', 'Permissions')
 $script:ADAuditNotCompared = @('Events', 'Runner', 'Reachability')
 
 function Read-ADAuditRun {
@@ -24,6 +24,8 @@ function Read-ADAuditRun {
     if (-not (Test-Path -LiteralPath $Path)) { throw "Baseline not found: $Path" }
     $run = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $run.Results) { throw "Baseline has no Results: $Path" }
+    # PowerShell 7 turns ISO timestamps into DateTime; keep one readable format
+    if ($run.Meta -and $run.Meta.Generated -is [datetime]) { $run.Meta.Generated = $run.Meta.Generated.ToString('yyyy-MM-dd HH:mm') }
     return $run
 }
 
@@ -110,9 +112,10 @@ function Compare-ADAuditRun {
         $h = @{}
         foreach ($r in $rows) {
             if (& $skip $r) { continue }
-            foreach ($issue in (Split-ADAuditFinding ([string]$r.Finding))) {
-                $key = "$($r.Scanner)|$($r.Target)|$(ConvertTo-ADAuditIssueKey $issue)".ToLowerInvariant()
-                if (-not $h.ContainsKey($key)) { $h[$key] = [pscustomobject]@{ Row = $r; Issue = $issue.Trim() } }
+            foreach ($i in (Get-ADAuditIssue -Row $r)) {
+                if ($i.Severity -in 'OK', 'Error') { continue }
+                $key = "$($r.Scanner)|$($r.Target)|$(ConvertTo-ADAuditIssueKey $i.Issue)".ToLowerInvariant()
+                if (-not $h.ContainsKey($key)) { $h[$key] = [pscustomobject]@{ Row = $r; Issue = $i.Issue; Severity = $i.Severity } }
             }
         }
         $h
@@ -127,7 +130,7 @@ function Compare-ADAuditRun {
     foreach ($k in $cF.Keys) {
         if (-not $pF.ContainsKey($k)) {
             $x = $cF[$k]
-            New-ADAuditChange -Change 'New' -Severity $x.Row.Severity -Scanner $x.Row.Scanner -Target $x.Row.Target -Detail $x.Issue
+            New-ADAuditChange -Change 'New' -Severity $x.Severity -Scanner $x.Row.Scanner -Target $x.Row.Target -Detail $x.Issue
         }
     }
     foreach ($k in $pF.Keys) {

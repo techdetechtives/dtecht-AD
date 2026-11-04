@@ -170,5 +170,6 @@ function Invoke-ADAuditSmbScan {
         SigningEnabled     = $signingEnabled
         SigningRequired    = $signingRequired
         Smb1               = $smb1
+        IssueSeverity = (@($sev) -join ';')
     })
 }

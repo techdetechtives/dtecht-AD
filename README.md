@@ -22,10 +22,16 @@ Output goes to `.\ADAudit-<timestamp>\`:
 | File | Contents |
 |---|---|
 | `<Scanner>.csv` | All rows from that scanner |
-| `AllFindings.csv` | Every row that isn't OK |
+| `AllFindings.csv` | One row per issue that isn't OK, with Severity, Category, Rule and Remediation |
 | `results.json` | All results plus run metadata, for a later `-Baseline` or for pushing into a SIEM/platform |
 | `Changes.csv` | Only with `-Baseline`: what changed since the earlier run |
-| `Summary.html` | Counts per scanner, changes since baseline, High/Medium findings |
+| `Summary.html` | Risk score per category, rules triggered with remediation, changes since baseline, High/Medium findings, recent DC changes |
+
+## Risk score
+
+Every finding is mapped to a rule (e.g. *DCSync rights for non-DC accounts*, *Password never expires*) with remediation text, and each rule belongs to one of seven categories: Privileged Access, Permissions, Kerberos & Delegation, Passwords & Credentials, Host Hardening, Monitoring & Audit, Stale Objects & Hygiene.
+
+Scoring works like PingCastle: lower is better, 0–100 per category. Each triggered rule counts **once**, at the highest severity seen (High 15, Medium 8, Low 3 points), so 2,000 stale accounts don't outweigh one DCSync finding. The overall score is the worst category. Info findings and Events (activity, not posture) aren't scored. Scores are also stored in `results.json` (`Meta.Score`), so you can track them over time.
 
 ## Comparing runs (`-Baseline`)
 
@@ -43,13 +49,14 @@ A simple routine: run weekly as a scheduled task with `-Baseline` pointing at th
 
 | Scanner | Type | What it checks |
 |---|---|---|
-| DomainPolicy | LDAP | Min password length, history, max age, lockout threshold, MachineAccountQuota, krbtgt password age, Guest enabled, Anonymous/Everyone in Pre-Windows 2000 Compatible Access, functional level, FGPP count |
-| Accounts | LDAP | Privileged accounts (direct + nested), service accounts (SPN or name pattern) and gMSAs, password never expires, password not required, reversible encryption, DES-only, never logged on, stale, old passwords, Kerberoastable (SPN on user), AS-REP roastable, unconstrained/constrained delegation (users and non-DC computers), too many group memberships, sIDHistory, orphaned adminCount=1, admins not in Protected Users / not "sensitive", password-like text in description |
-| Groups | LDAP | Every member of Administrators, Domain/Enterprise/Schema Admins, Account/Server/Print/Backup Operators, GPO Creator Owners, Key Admins, DnsAdmins, with Direct/Nested; computers, foreign principals, disabled accounts in those groups; operator groups that aren't empty; group nesting deeper than `-MaxNestingDepth`; circular nesting |
+| DomainPolicy | LDAP | Min password length, history, max age, lockout threshold, MachineAccountQuota, krbtgt password age, Guest enabled, Anonymous/Everyone in Pre-Windows 2000 Compatible Access, functional level, each fine-grained password policy (reversible encryption, admin policy under 14 chars, policies that apply to nothing), admins with only the default policy |
+| Accounts | LDAP | Privileged accounts (direct, nested and via primaryGroupID), service accounts (SPN or name pattern) and gMSAs, password never expires, password not required, reversible encryption, DES-only, never logged on, stale, old passwords, Kerberoastable (SPN on user), AS-REP roastable, unconstrained/constrained delegation (users and non-DC computers), too many group memberships, sIDHistory, orphaned adminCount=1, admins not in Protected Users / not "sensitive", password-like text in description, cleartext passwords in `userPassword` / `unixUserPassword` / `msSFU30Password` / `os400Password`, unexpected primaryGroupID on users and computers |
+| Groups | LDAP | Every member of Administrators, Domain/Enterprise/Schema Admins, Account/Server/Print/Backup Operators, GPO Creator Owners, Key Admins, DnsAdmins, with Direct/Nested; computers, foreign principals, disabled accounts in those groups; operator groups that aren't empty; group nesting deeper than `-MaxNestingDepth`; circular nesting; hidden admin membership via primaryGroupID; more than `-MaxDomainAdmins` enabled users in Domain/Enterprise Admins or Administrators; empty groups and OUs |
 | OSInventory | LDAP | Unsupported / ending-soon Windows versions (built-in lifecycle table, late 2026), stale computer accounts |
 | LapsBitLocker | LDAP | Legacy and Windows LAPS coverage and expiry, BitLocker recovery key escrow (reads timestamps/object existence only, never passwords or keys) |
 | DomainControllers | LDAP + DNS | Every DC with site, IPs, OS, RODC/Global Catalog, FSMO roles. Flags: only one writable DC, DC account not seen for 30+ days, FSMO role held by a deleted DC, leftover NTDS Settings with no DC |
 | AuditPolicy | LDAP + SYSVOL | Audit policy GPOs give DCs (domain + Domain Controllers OU links, honouring disabled/enforced links, block inheritance and disabled computer settings). Reads `audit.csv` and `GptTmpl.inf`, flags missing subcategories (Security Group Management, User Account Management, Directory Service Changes, Kerberos, etc.) and Security log size |
+| Permissions | LDAP + SYSVOL | Reads owner + DACL of key objects (one hop, no BloodHound). **DCSync** rights on the domain root; dangerous rights for non-Tier-0 principals (GenericAll, WriteDacl, WriteOwner, write all properties, all extended rights, add member, reset password, add key credential / shadow credentials, write SPN, RBCD, logon script, altSecurityIdentities, gPLink) on the domain root, AdminSDHolder, Domain Controllers OU, DC computers, krbtgt, privileged groups and their members; non-Tier-0 **owners** of those objects; who can **edit GPOs** (AD object and SYSVOL folder; High when the GPO applies to DCs or the domain); who can **read LAPS passwords** (where the delegation is set); who can **read gMSA passwords**. Broad groups (Everyone, Authenticated Users, Domain Users...) are called out |
 | Events | RPC to DCs | Security log for the last `-EventDays`: users created/enabled/disabled/deleted/renamed/locked, password resets, computer accounts created, members added/removed from groups (High for privileged groups), SID history, DSRM password set, 4738 changes that matter (delegation, pre-auth off, password not required, SID history, primary group), and 5136 changes to SPN, delegation/RBCD, shadow credentials (msDS-KeyCredentialLink), sIDHistory, ACLs on AdminSDHolder/domain root, gPLink, logon scripts. Also reports how far back each DC's Security log actually goes |
 | Spooler | TCP 445 | Print Spooler pipe reachable (High on DCs) |
 | Smb | TCP 445 | SMBv1 enabled, SMB signing required, highest SMB2/3 dialect (NEGOTIATE packets only, no auth) |
@@ -71,12 +78,15 @@ A simple routine: run weekly as a scheduled task with `-Baseline` pointing at th
 | `-ComputerName`, `-DomainControllersOnly` | | Limit host scanners (and which DCs Events reads) |
 | `-EventDays` / `-EventMaxPerDC` | 7 / 5000 | Events time window and per-DC cap |
 | `-Baseline` | | Earlier run folder or `results.json` to compare against |
+| `-MaxDomainAdmins` | 5 | Flag Domain/Enterprise Admins or Administrators with more enabled users |
+| `-SkipSysvol` | off | Permissions: don't read GPO folder ACLs in SYSVOL |
 
 ## Which account to run as
 
 - **AD-only scanners:** any domain user works. BitLocker recovery objects are usually visible only to Domain Admins; otherwise the result shows `NotVisible` rather than false findings.
 - **LocalAdmin:** needs local admin on targets (Windows 10 1607+ / Server 2016+ restrict remote SAM to admins). Non-admin runs show "Access denied".
 - **Events:** the account must be in **Event Log Readers** on DCs (or be a Domain Admin), and TCP 135 + dynamic RPC ports to DCs must be open. Events only show up if the audit subcategories are on, so check the AuditPolicy scanner. 5136 events also need SACLs on the objects.
+- **Permissions:** any domain user can read the owner and DACL of these objects. Principals are not expanded, so check who is in a flagged group. Only Allow ACEs are evaluated; a Deny ACE could block a reported right in rare cases.
 - **AuditPolicy:** any domain user. SYSVOL is read over SMB with your current Windows logon, not `-Credential`.
 - **Share:** run as a *plain domain user*. Any share root that account can list is readable by every domain user. To use another identity for host scans: `runas /netonly /user:CORP\audituser powershell.exe`.
 

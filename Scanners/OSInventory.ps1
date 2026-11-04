@@ -128,6 +128,7 @@ function Invoke-ADAuditOSInventory {
             SupportStatus      = $status
             LastLogonUtc       = $c.LastLogonUtc
             IsStale            = $c.IsStale
+            IssueSeverity = (@($sev) -join ';')
         })
     }
 }

@@ -64,13 +64,18 @@ function Invoke-ADAuditLdapQuery {
         [Parameter(Mandatory)][string]$Filter,
         [string[]]$Properties = @('distinguishedName'),
         [pscredential]$Credential,
-        [ValidateSet('Base', 'OneLevel', 'Subtree')][string]$Scope = 'Subtree'
+        [ValidateSet('Base', 'OneLevel', 'Subtree')][string]$Scope = 'Subtree',
+        # Return nTSecurityDescriptor (owner + DACL only; readable without SeSecurityPrivilege)
+        [switch]$SecurityDescriptor,
+        [int]$SizeLimit = 0
     )
     if (-not $SearchBase) { $SearchBase = Get-ADAuditDefaultNamingContext -Server $Server -Credential $Credential }
+    if ($SecurityDescriptor -and $Properties -notcontains 'nTSecurityDescriptor') { $Properties = @($Properties) + 'nTSecurityDescriptor' }
 
     $root = New-ADAuditDirectoryEntry -Path (Join-ADAuditLdapPath -Server $Server -DistinguishedName $SearchBase) -Credential $Credential
     $searcher = New-Object System.DirectoryServices.DirectorySearcher($root, $Filter)
-    $searcher.PageSize = 1000
+    if ($SizeLimit -gt 0) { $searcher.SizeLimit = $SizeLimit } else { $searcher.PageSize = 1000 }
+    if ($SecurityDescriptor) { $searcher.SecurityMasks = [System.DirectoryServices.SecurityMasks]'Owner, Dacl' }
     $searcher.SearchScope = [System.DirectoryServices.SearchScope]$Scope
     $searcher.PropertiesToLoad.Clear()
     foreach ($p in $Properties) { [void]$searcher.PropertiesToLoad.Add($p) }
@@ -192,7 +197,8 @@ function ConvertTo-ADAuditLdapFilterValue {
 function ConvertTo-ADAuditSidString {
     param($Value)
     if ($null -eq $Value) { return $null }
-    try { return (New-Object System.Security.Principal.SecurityIdentifier([byte[]]$Value, 0)).Value } catch { return $null }
+    if ($Value -is [string]) { return $Value }
+    try { return (ConvertFrom-ADAuditSidBytes -Bytes ([byte[]]$Value)) } catch { return $null }
 }
 
 function ConvertTo-ADAuditDnsName {
