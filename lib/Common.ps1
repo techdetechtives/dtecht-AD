@@ -25,7 +25,12 @@ function New-ADAuditDirectoryEntry {
     if ($Credential) {
         return New-Object System.DirectoryServices.DirectoryEntry($Path, $Credential.UserName, $Credential.GetNetworkCredential().Password, $auth)
     }
-    return New-Object System.DirectoryServices.DirectoryEntry($Path, $null, $null, $auth)
+    # Don't pass $null user/password: PowerShell turns $null into "" for .NET string
+    # arguments, and an empty user name makes ADSI bind ANONYMOUSLY (searches then fail
+    # with "An operations error occurred"). Bind as the current user, then set the flags.
+    $entry = New-Object System.DirectoryServices.DirectoryEntry($Path)
+    $entry.AuthenticationType = $auth
+    return $entry
 }
 
 function Get-ADAuditDefaultNamingContext {
